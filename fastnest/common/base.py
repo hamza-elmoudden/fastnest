@@ -1,0 +1,2 @@
+class SchemaAwarePipe:
+    schema = None
