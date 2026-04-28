@@ -325,7 +325,8 @@ def find_one(self, id: int):
 FastNest now supports real-time communication out of the box. You can create WebSocket gateways just as easily as HTTP controllers.
 Example Gateway
 Python
-
+---
+```
 ```
 from fastnest.core import WebSocketGateway, OnGatewayConnection, OnGatewayDisconnect
 from fastapi import WebSocket
@@ -342,8 +343,10 @@ class ChatGateway(OnGatewayConnection, OnGatewayDisconnect):
     @SubscribeMessage("message")
     async def handle_message(self, client: WebSocket, data: any):
         await client.send_json({"event": "reply", "data": "Message received!"})
+    
 ```
-
+```
+---
 🛠️ Quick Start
 1. Installation
 Bash
