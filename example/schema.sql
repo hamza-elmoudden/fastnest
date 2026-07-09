@@ -14,7 +14,9 @@
 -- TRUNCATE posts, refresh_tokens, users RESTART IDENTITY CASCADE;
 --
 --  Password for all seed users: secret123
---  Hash: fcf730b6d95236ecd3c9fc2d92d7b6b2bb061514961aec041d6c7a7192f592e4
+--  Hashed with PBKDF2-HMAC-SHA256, 200,000 iterations, per-row random salt
+--  (see example/example/utils/security.py:hash_password) — demo/seed values
+--  only, not real credentials.
 -- ══════════════════════════════════════════════════════
 
 -- ── Extensions ──────────────────────────────────────
@@ -30,6 +32,7 @@ CREATE TABLE IF NOT EXISTS users (
     name          VARCHAR(100)  NOT NULL,
     email         VARCHAR(255)  NOT NULL UNIQUE,
     password_hash VARCHAR(255)  NOT NULL,
+    password_salt VARCHAR(64)   NOT NULL,
     roles         user_role[]   NOT NULL DEFAULT '{user}',
     is_active     BOOLEAN       NOT NULL DEFAULT TRUE,
     created_at    TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
@@ -78,16 +81,14 @@ CREATE TRIGGER posts_updated_at
 
 -- ── Seed Data ─────────────────────────────────────────
 -- Password for all seed users: "secret123"
--- SHA256("secret123") = "d76df8e7aefc5a0b4d9d9f2a5c5e9f2a8b1c3d..." (computed below via pgcrypto)
--- We use encode(digest(password, 'sha256'), 'hex') but need pgcrypto
--- For simplicity seeds use a hardcoded known hash:
--- sha256('secret123') = 'fcf730b6d95236ecd3c9fc2d92d7b6b2bb061514961aec041d6c7a7192f592e4'
--- Run: python3 -c "import hashlib; print(hashlib.sha256(b'secret123').hexdigest())"
+-- password_hash/password_salt below are PBKDF2-HMAC-SHA256 (200,000 iterations)
+-- of "secret123", generated via:
+--   python3 -c "from example.example.utils.security import hash_password; print(hash_password('secret123'))"
 
-INSERT INTO users (name, email, password_hash, roles) VALUES
-    ('Admin User',    'admin@fastnest.dev', 'fcf730b6d95236ecd3c9fc2d92d7b6b2bb061514961aec041d6c7a7192f592e4', '{admin,user}'),
-    ('Regular User',  'user@fastnest.dev',  'fcf730b6d95236ecd3c9fc2d92d7b6b2bb061514961aec041d6c7a7192f592e4', '{user}'),
-    ('Moderator',     'mod@fastnest.dev',   'fcf730b6d95236ecd3c9fc2d92d7b6b2bb061514961aec041d6c7a7192f592e4', '{moderator,user}')
+INSERT INTO users (name, email, password_hash, password_salt, roles) VALUES
+    ('Admin User',    'admin@fastnest.dev', 'ae1a300122076fa9431f3e5cf7f0f195f0c9bde2b90ab0151efbf40d7e1f1806', '0a590ebd44abd760ab2e9ddce718b0f9', '{admin,user}'),
+    ('Regular User',  'user@fastnest.dev',  'ae1a300122076fa9431f3e5cf7f0f195f0c9bde2b90ab0151efbf40d7e1f1806', '0a590ebd44abd760ab2e9ddce718b0f9', '{user}'),
+    ('Moderator',     'mod@fastnest.dev',   'ae1a300122076fa9431f3e5cf7f0f195f0c9bde2b90ab0151efbf40d7e1f1806', '0a590ebd44abd760ab2e9ddce718b0f9', '{moderator,user}')
 ON CONFLICT (email) DO NOTHING;
 
 INSERT INTO posts (title, content, author_id)

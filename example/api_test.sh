@@ -5,7 +5,10 @@
 # ══════════════════════════════════════════════════════
 
 BASE="http://localhost:8000"
-DB_URL="${DB_URL:-postgresql://postgres:123456789@localhost/fastnest_db}"
+if [ -z "$DB_URL" ]; then
+  echo "  ❌ DB_URL is not set. Export it (see example/.env.example) before running this script."
+  exit 1
+fi
 SEP="─────────────────────────────────────────"
 PASS=0; FAIL=0
 
@@ -14,10 +17,11 @@ echo "$SEP"
 echo "  Resetting database..."
 psql "$DB_URL" -q << 'SQL'
 TRUNCATE posts, refresh_tokens, users RESTART IDENTITY CASCADE;
-INSERT INTO users (name, email, password_hash, roles) VALUES
-    ('Admin User',   'admin@fastnest.dev', 'fcf730b6d95236ecd3c9fc2d92d7b6b2bb061514961aec041d6c7a7192f592e4', '{admin,user}'),
-    ('Regular User', 'user@fastnest.dev',  'fcf730b6d95236ecd3c9fc2d92d7b6b2bb061514961aec041d6c7a7192f592e4', '{user}'),
-    ('Moderator',    'mod@fastnest.dev',   'fcf730b6d95236ecd3c9fc2d92d7b6b2bb061514961aec041d6c7a7192f592e4', '{moderator,user}');
+-- password_hash/password_salt = PBKDF2-HMAC-SHA256("secret123"), see schema.sql
+INSERT INTO users (name, email, password_hash, password_salt, roles) VALUES
+    ('Admin User',   'admin@fastnest.dev', 'ae1a300122076fa9431f3e5cf7f0f195f0c9bde2b90ab0151efbf40d7e1f1806', '0a590ebd44abd760ab2e9ddce718b0f9', '{admin,user}'),
+    ('Regular User', 'user@fastnest.dev',  'ae1a300122076fa9431f3e5cf7f0f195f0c9bde2b90ab0151efbf40d7e1f1806', '0a590ebd44abd760ab2e9ddce718b0f9', '{user}'),
+    ('Moderator',    'mod@fastnest.dev',   'ae1a300122076fa9431f3e5cf7f0f195f0c9bde2b90ab0151efbf40d7e1f1806', '0a590ebd44abd760ab2e9ddce718b0f9', '{moderator,user}');
 INSERT INTO posts (title, content, author_id)
 SELECT 'Post ' || g, 'Content of post ' || g, (SELECT id FROM users WHERE email = 'admin@fastnest.dev')
 FROM generate_series(1, 3) g;

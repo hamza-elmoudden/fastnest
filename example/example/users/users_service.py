@@ -13,9 +13,9 @@ class UsersService:
         self.db = db
 
     async def create(self, data):
-        hashed = hash_password(data.password)
-        query = "INSERT INTO users (name, email, password_hash, roles) VALUES ($1, $2, $3, $4) RETURNING id, name, email, roles"
-        row = await self.db.fetchrow(query, data.name, data.email, hashed, data.roles)
+        password_hash, password_salt = hash_password(data.password)
+        query = "INSERT INTO users (name, email, password_hash, password_salt, roles) VALUES ($1, $2, $3, $4, $5) RETURNING id, name, email, roles"
+        row = await self.db.fetchrow(query, data.name, data.email, password_hash, password_salt, data.roles)
         return dict(row)
 
     async def find_all(self, page: int = 1, limit: int = 10) -> dict:
