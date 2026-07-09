@@ -7,7 +7,7 @@ __version__ = "0.2.0"
 # ─── Core ───
 from fastnest.core.factory import (
     create_app,
-    add_global_guard, add_global_interceptor, add_global_pipe,
+    add_global_guard, add_global_interceptor, add_global_pipe, add_global_filter,
 )
 from fastnest.core.decorators import (
     Module, Controller, Injectable, Global,
@@ -18,6 +18,7 @@ from fastnest.core.params import Body, Query, Param, Headers, Req
 from fastnest.core.middleware import NestMiddleware, MiddlewareConfig
 from fastnest.core.reflector import Reflector
 from fastnest.core.dynamic_module import DynamicModule
+from fastnest.core.tokens import Inject
 
 # ─── Common ───
 from fastnest.common.interfaces import (
@@ -47,12 +48,13 @@ __all__ = [
     "__version__",
     # Core
     "create_app", "add_global_guard", "add_global_interceptor", "add_global_pipe",
+    "add_global_filter",
     "Module", "Controller", "Injectable", "Global",
     "Get", "Post", "Put", "Delete", "Patch",
     "Body", "Query", "Param", "Headers", "Req",
     "UsePipe", "UseGuard", "UseInterceptor", "UseExceptionFilter",
     "NestMiddleware", "MiddlewareConfig",
-    "Reflector", "DynamicModule",
+    "Reflector", "DynamicModule", "Inject",
     # Interfaces
     "PipeTransform", "CanActivate", "NestInterceptor", "ExceptionFilter",
     # Pipes

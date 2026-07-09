@@ -11,17 +11,22 @@ from fastapi.testclient import TestClient
 from fastapi.websockets import WebSocketDisconnect
 
 from fastnest.core.decorators import (
-    Module, Controller, Injectable,
+    Module, Controller, Injectable, Global,
     Get, Post, Put, Delete, Patch,
-    UseGuard, UseInterceptor, UsePipe,
+    UseGuard, UseInterceptor, UsePipe, UseExceptionFilter,
 )
-from fastnest.core.factory import create_app
+from fastnest.core.factory import (
+    create_app, add_global_guard, add_global_interceptor, add_global_pipe,
+    add_global_filter,
+)
 from fastnest.core.params import Body, Param, Query
+from fastnest.core.di import Container
+from fastnest.core.tokens import Inject
 from fastnest.core.websocket import (
     WebSocketGateway, SubscribeMessage, OnConnect, OnDisconnect,
     WebSocketClient, ConnectionManager,
 )
-from fastnest.common.interfaces import CanActivate, NestInterceptor
+from fastnest.common.interfaces import CanActivate, NestInterceptor, PipeTransform, ExceptionFilter
 from fastnest.common.pipes import ValidationPipe, ParseIntPipe
 from fastnest.common.exceptions import (
     NotFoundException, ForbiddenException, UnauthorizedException,
@@ -309,7 +314,313 @@ class TestDI:
 
 
 # ══════════════════════════════════════════════════════════════════
-#  6. WebSocket Tests
+#  6. Custom Provider Tests
+# ══════════════════════════════════════════════════════════════════
+
+class TestCustomProviders:
+    def test_use_value_provider_injected_into_service(self):
+        @Injectable()
+        class ConfigConsumer:
+            def __init__(self, config: dict = Inject("APP_CONFIG")):
+                self.config = config
+
+        container = Container()
+        container.register_provider({"provide": "APP_CONFIG", "useValue": {"debug": True}})
+        consumer = container.get(ConfigConsumer)
+        assert consumer.config == {"debug": True}
+
+    def test_use_factory_provider_with_inject_deps(self):
+        @Injectable()
+        class DbUrl:
+            def __init__(self):
+                self.value = "postgres://localhost"
+
+        def make_connection(url):
+            return {"connection": url.value}
+
+        container = Container()
+        container.register_provider({
+            "provide": "DB_CONNECTION",
+            "useFactory": make_connection,
+            "inject": [DbUrl],
+        })
+        conn = container.get("DB_CONNECTION")
+        assert conn == {"connection": "postgres://localhost"}
+
+    def test_use_class_provider_token_differs_from_impl(self):
+        class AbstractLogger:
+            pass
+
+        class ConsoleLogger(AbstractLogger):
+            def log(self, msg):
+                return f"console: {msg}"
+
+        container = Container()
+        container.register_provider({"provide": AbstractLogger, "useClass": ConsoleLogger})
+        logger = container.get(AbstractLogger)
+        assert isinstance(logger, ConsoleLogger)
+        assert logger.log("hi") == "console: hi"
+
+    def test_global_custom_provider_exported_across_modules(self):
+        @Injectable()
+        class FeatureFlagsConsumer:
+            def __init__(self, flags: dict = Inject("FEATURE_FLAGS")):
+                self.flags = flags
+
+        @Controller("flags")
+        class FlagsController:
+            def __init__(self, svc: FeatureFlagsConsumer):
+                self.svc = svc
+
+            @Get()
+            async def get_flags(self):
+                return self.svc.flags
+
+        @Global()
+        @Module(providers=[
+            {"provide": "FEATURE_FLAGS", "useValue": {"beta": True}},
+        ])
+        class ConfigModule:
+            pass
+
+        @Module(imports=[ConfigModule], controllers=[FlagsController],
+                providers=[FeatureFlagsConsumer])
+        class FeatureModule:
+            pass
+
+        app = create_app(FeatureModule)
+        with TestClient(app) as c:
+            r = c.get("/flags")
+            assert r.status_code == 200
+            assert r.json() == {"beta": True}
+
+    def test_inject_with_string_token_in_constructor(self):
+        @Injectable()
+        class Greeter:
+            def __init__(self, name: str = Inject("GREETEE_NAME")):
+                self.name = name
+
+        container = Container()
+        container.register_value("GREETEE_NAME", "World")
+        greeter = container.get(Greeter)
+        assert greeter.name == "World"
+
+    def test_unregistered_token_raises(self):
+        @Injectable()
+        class NeedsMissingToken:
+            def __init__(self, dep=Inject("MISSING_TOKEN")):
+                self.dep = dep
+
+        container = Container()
+        with pytest.raises(LookupError):
+            container.get(NeedsMissingToken)
+
+        with pytest.raises(LookupError):
+            container.get("ANOTHER_MISSING_TOKEN")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  7. Global Guard/Pipe/Interceptor Isolation Tests
+# ══════════════════════════════════════════════════════════════════
+
+class AlwaysBlockGuard(CanActivate):
+    def can_activate(self, request: Request) -> bool:
+        return False
+
+
+@Injectable()
+class PingService:
+    def ping(self):
+        return {"ping": "pong"}
+
+
+@Controller("ping")
+class PingController:
+    def __init__(self, svc: PingService):
+        self.svc = svc
+
+    @Get()
+    async def ping(self):
+        return self.svc.ping()
+
+    @Get("echo")
+    async def echo(self, msg: str = Query(default="hi")):
+        return {"msg": msg}
+
+
+@Module(controllers=[PingController], providers=[PingService])
+class PingModule:
+    pass
+
+
+class TestGlobalRegistryIsolation:
+    def test_global_guard_does_not_leak_to_other_apps(self):
+        # App built with NO global guard — must stay unaffected.
+        unaffected_app = create_app(PingModule)
+
+        # Global guard registered only after the first app was built, so it
+        # should apply exclusively to the next app created.
+        add_global_guard(AlwaysBlockGuard)
+        guarded_app = create_app(PingModule)
+
+        # A third app, built after the registry was consumed above, must not
+        # inherit the guard either — proves the staged registration doesn't
+        # leak forward past the app that consumed it.
+        later_app = create_app(PingModule)
+
+        with TestClient(unaffected_app) as c:
+            r = c.get("/ping")
+            assert r.status_code == 200
+            assert r.json() == {"ping": "pong"}
+
+        with TestClient(guarded_app) as c:
+            r = c.get("/ping")
+            assert r.status_code == 403
+
+        with TestClient(later_app) as c:
+            r = c.get("/ping")
+            assert r.status_code == 200
+            assert r.json() == {"ping": "pong"}
+
+    def test_explicit_guards_param_is_scoped_to_that_app_only(self):
+        scoped_app = create_app(PingModule, guards=[AlwaysBlockGuard])
+        other_app = create_app(PingModule)
+
+        with TestClient(scoped_app) as c:
+            assert c.get("/ping").status_code == 403
+
+        with TestClient(other_app) as c:
+            assert c.get("/ping").status_code == 200
+
+    def test_global_interceptor_is_also_isolated(self):
+        calls = []
+
+        class RecordingInterceptor(NestInterceptor):
+            def intercept_before(self, request):
+                calls.append("before")
+
+            def intercept_after(self, request, response):
+                calls.append("after")
+                return response
+
+        add_global_interceptor(RecordingInterceptor)
+        recorded_app = create_app(PingModule)
+        unrecorded_app = create_app(PingModule)
+
+        with TestClient(recorded_app) as c:
+            c.get("/ping")
+        assert calls == ["before", "after"]
+
+        calls.clear()
+        with TestClient(unrecorded_app) as c:
+            c.get("/ping")
+        assert calls == []
+
+    def test_global_pipe_is_also_isolated(self):
+        class ShoutPipe(PipeTransform):
+            def transform(self, value):
+                return value.upper() if isinstance(value, str) else value
+
+        add_global_pipe(ShoutPipe)
+        shouting_app = create_app(PingModule)
+        quiet_app = create_app(PingModule)
+
+        with TestClient(shouting_app) as c:
+            assert c.get("/ping/echo", params={"msg": "hi"}).json() == {"msg": "HI"}
+
+        with TestClient(quiet_app) as c:
+            assert c.get("/ping/echo", params={"msg": "hi"}).json() == {"msg": "hi"}
+
+
+# ══════════════════════════════════════════════════════════════════
+#  8. Exception Filter Tests
+# ══════════════════════════════════════════════════════════════════
+
+class BoomError(Exception):
+    pass
+
+
+@Injectable()
+class BoomService:
+    def boom(self):
+        raise BoomError("kaboom")
+
+
+class ControllerFilter(ExceptionFilter):
+    def catch(self, exception: Exception, request):
+        return {"statusCode": 500, "message": f"controller:{exception}"}
+
+
+class GlobalFilter(ExceptionFilter):
+    def catch(self, exception: Exception, request):
+        return {"statusCode": 500, "message": f"global:{exception}"}
+
+
+@UseExceptionFilter(ControllerFilter)
+@Controller("boom-ctrl")
+class BoomControllerFiltered:
+    def __init__(self, svc: BoomService):
+        self.svc = svc
+
+    @Get()
+    async def boom(self):
+        self.svc.boom()
+
+    @Get("http")
+    async def boom_http(self):
+        raise NotFoundException("nope")
+
+
+@Controller("boom-plain")
+class BoomControllerPlain:
+    def __init__(self, svc: BoomService):
+        self.svc = svc
+
+    @Get()
+    async def boom(self):
+        self.svc.boom()
+
+
+@Module(controllers=[BoomControllerFiltered, BoomControllerPlain], providers=[BoomService])
+class BoomModule:
+    pass
+
+
+class TestExceptionFilters:
+    def test_controller_level_filter_catches_unhandled_exception(self):
+        app = create_app(BoomModule)
+        with TestClient(app) as c:
+            r = c.get("/boom-ctrl")
+            assert r.status_code == 500
+            assert r.json()["message"] == "controller:kaboom"
+
+    def test_http_exception_bypasses_filters(self):
+        app = create_app(BoomModule)
+        with TestClient(app) as c:
+            r = c.get("/boom-ctrl/http")
+            assert r.status_code == 404
+
+    def test_global_filter_catches_exception_from_unfiltered_controller(self):
+        add_global_filter(GlobalFilter)
+        app = create_app(BoomModule)
+        with TestClient(app) as c:
+            r = c.get("/boom-plain")
+            assert r.status_code == 500
+            assert r.json()["message"] == "global:kaboom"
+
+    def test_controller_level_filter_overrides_global_filter(self):
+        # Both a global filter and a controller-level filter can handle this
+        # exception; the more specific (controller-level) one must win.
+        add_global_filter(GlobalFilter)
+        app = create_app(BoomModule)
+        with TestClient(app) as c:
+            r = c.get("/boom-ctrl")
+            assert r.status_code == 500
+            assert r.json()["message"] == "controller:kaboom"
+
+
+# ══════════════════════════════════════════════════════════════════
+#  9. WebSocket Tests
 # ══════════════════════════════════════════════════════════════════
 
 connected_clients: list = []
@@ -438,3 +749,148 @@ class TestWebSocket:
             ws.send_text(json.dumps({"event": "message", "data": "still alive"}))
             echo = ws.receive_json()
             assert echo["data"] == "still alive"
+
+
+# ══════════════════════════════════════════════════════════════════
+#  10. WebSocket Namespace & Room Tests
+# ══════════════════════════════════════════════════════════════════
+
+@WebSocketGateway("/ws/ns", namespace="alpha")
+class AlphaGateway:
+    @SubscribeMessage("broadcast")
+    async def handle_broadcast(self, data: str, client: WebSocketClient):
+        await self.manager.broadcast({"event": "broadcast", "data": data, "from": "alpha"})
+
+
+@WebSocketGateway("/ws/ns", namespace="beta")
+class BetaGateway:
+    @SubscribeMessage("broadcast")
+    async def handle_broadcast(self, data: str, client: WebSocketClient):
+        await self.manager.broadcast({"event": "broadcast", "data": data, "from": "beta"})
+
+
+@Module(gateways=[AlphaGateway, BetaGateway])
+class NamespaceModule:
+    pass
+
+
+@WebSocketGateway("/ws/rooms")
+class RoomGateway:
+    @SubscribeMessage("join")
+    async def handle_join(self, data: str, client: WebSocketClient):
+        await client.join(data)
+        await client.send({"event": "joined", "room": data})
+
+    @SubscribeMessage("leave")
+    async def handle_leave(self, data: str, client: WebSocketClient):
+        await client.leave(data)
+        await client.send({"event": "left", "room": data})
+
+    @SubscribeMessage("room_broadcast")
+    async def handle_room_broadcast(self, data: dict, client: WebSocketClient):
+        await self.manager.broadcast_to_room(
+            data["room"], {"event": "room_message", "data": data["message"]}
+        )
+
+    @SubscribeMessage("room_count")
+    async def handle_room_count(self, data: str, client: WebSocketClient):
+        await client.send({"event": "room_count", "data": len(self.manager.room_clients(data))})
+
+
+@Module(gateways=[RoomGateway])
+class RoomModule:
+    pass
+
+
+@Module(imports=[NamespaceModule, RoomModule])
+class NsRoomAppModule:
+    pass
+
+
+@pytest.fixture(scope="module")
+def ns_room_client():
+    app = create_app(NsRoomAppModule)
+    with TestClient(app) as c:
+        yield c
+
+
+class TestWebSocketNamespacesAndRooms:
+    def test_namespaces_isolate_connections(self, ns_room_client):
+        import json
+        with ns_room_client.websocket_connect("/ws/ns/alpha") as a1, \
+             ns_room_client.websocket_connect("/ws/ns/alpha") as a2, \
+             ns_room_client.websocket_connect("/ws/ns/beta") as b1:
+            a1.send_text(json.dumps({"event": "broadcast", "data": "hi-alpha"}))
+            msg_a2 = a2.receive_json()
+            assert msg_a2["from"] == "alpha"
+            assert msg_a2["data"] == "hi-alpha"
+
+            # A broadcast on the alpha gateway must not leak to the beta
+            # gateway's connections — b1 must only ever see its own broadcast.
+            b1.send_text(json.dumps({"event": "broadcast", "data": "hi-beta"}))
+            msg_b1 = b1.receive_json()
+            assert msg_b1["from"] == "beta"
+            assert msg_b1["data"] == "hi-beta"
+
+    def test_colliding_path_and_namespace_raises_at_create_app(self):
+        @WebSocketGateway("/ws/dup", namespace="x")
+        class DupGatewayA:
+            pass
+
+        @WebSocketGateway("/ws/dup", namespace="x")
+        class DupGatewayB:
+            pass
+
+        @Module(gateways=[DupGatewayA, DupGatewayB])
+        class DupModule:
+            pass
+
+        with pytest.raises(ValueError, match="collision"):
+            create_app(DupModule)
+
+    def test_room_broadcast_only_reaches_members(self, ns_room_client):
+        import json
+        with ns_room_client.websocket_connect("/ws/rooms") as c1, \
+             ns_room_client.websocket_connect("/ws/rooms") as c2, \
+             ns_room_client.websocket_connect("/ws/rooms") as c3:
+            c1.send_text(json.dumps({"event": "join", "data": "lobby"}))
+            c1.receive_json()
+            c2.send_text(json.dumps({"event": "join", "data": "lobby"}))
+            c2.receive_json()
+            # c3 deliberately does not join "lobby"
+
+            c1.send_text(json.dumps(
+                {"event": "room_broadcast", "data": {"room": "lobby", "message": "hey"}}
+            ))
+            assert c1.receive_json()["data"] == "hey"
+            assert c2.receive_json()["data"] == "hey"
+
+            # Prove c3 got nothing from the room broadcast: if it had leaked
+            # to c3, this "joined" ack for an unrelated room would not be the
+            # first message in c3's queue.
+            c3.send_text(json.dumps({"event": "join", "data": "other"}))
+            assert c3.receive_json() == {"event": "joined", "room": "other"}
+
+    def test_client_removed_from_room_on_disconnect(self, ns_room_client):
+        import json
+        with ns_room_client.websocket_connect("/ws/rooms") as c1:
+            c1.send_text(json.dumps({"event": "join", "data": "temp"}))
+            c1.receive_json()
+
+            with ns_room_client.websocket_connect("/ws/rooms") as c2:
+                c2.send_text(json.dumps({"event": "join", "data": "temp"}))
+                c2.receive_json()
+
+                c1.send_text(json.dumps({"event": "room_count", "data": "temp"}))
+                assert c1.receive_json()["data"] == 2
+            # c2 disconnects here
+
+            c1.send_text(json.dumps({"event": "room_count", "data": "temp"}))
+            assert c1.receive_json()["data"] == 1
+
+            # Broadcasting to the room must not error now that c2 is gone.
+            c1.send_text(json.dumps(
+                {"event": "room_broadcast", "data": {"room": "temp", "message": "still-here"}}
+            ))
+            msg = c1.receive_json()
+            assert msg["data"] == "still-here"
