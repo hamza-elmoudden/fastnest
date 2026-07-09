@@ -35,10 +35,11 @@ from fastnest.core.metadata import get_meta, set_meta
 class WebSocketClient:
     """Represents a single connected WebSocket client."""
 
-    def __init__(self, ws: WebSocket):
-        self._ws   = ws
-        self.id    = str(uuid.uuid4())
+    def __init__(self, ws: WebSocket, manager: Optional["ConnectionManager"] = None):
+        self._ws      = ws
+        self.id       = str(uuid.uuid4())
         self.data: Dict[str, Any] = {}   # arbitrary metadata per client
+        self._manager = manager
 
     async def send(self, message: Any) -> None:
         """Send a message — dict/list → JSON, anything else → text."""
@@ -56,6 +57,18 @@ class WebSocketClient:
     async def close(self, code: int = 1000) -> None:
         await self._ws.close(code)
 
+    async def join(self, room: str) -> None:
+        """Join a room on the owning ConnectionManager."""
+        if self._manager is None:
+            raise RuntimeError(f"WebSocketClient {self.id} has no ConnectionManager attached")
+        self._manager.join_room(self, room)
+
+    async def leave(self, room: str) -> None:
+        """Leave a room on the owning ConnectionManager."""
+        if self._manager is None:
+            raise RuntimeError(f"WebSocketClient {self.id} has no ConnectionManager attached")
+        self._manager.leave_room(self, room)
+
     @property
     def raw(self) -> WebSocket:
         return self._ws
@@ -67,12 +80,17 @@ class ConnectionManager:
 
     def __init__(self):
         self._clients: Dict[str, WebSocketClient] = {}
+        self._rooms: Dict[str, Set[str]] = {}
 
     def add(self, client: WebSocketClient) -> None:
         self._clients[client.id] = client
 
     def remove(self, client: WebSocketClient) -> None:
         self._clients.pop(client.id, None)
+        for room in list(self._rooms.keys()):
+            self._rooms[room].discard(client.id)
+            if not self._rooms[room]:
+                del self._rooms[room]
 
     @property
     def clients(self) -> List[WebSocketClient]:
@@ -100,6 +118,36 @@ class ConnectionManager:
             return True
         return False
 
+    def join_room(self, client: WebSocketClient, room: str) -> None:
+        """Add a client to a room."""
+        self._rooms.setdefault(room, set()).add(client.id)
+
+    def leave_room(self, client: WebSocketClient, room: str) -> None:
+        """Remove a client from a room."""
+        members = self._rooms.get(room)
+        if not members:
+            return
+        members.discard(client.id)
+        if not members:
+            del self._rooms[room]
+
+    def room_clients(self, room: str) -> List[WebSocketClient]:
+        """All currently-connected clients in a room."""
+        return [
+            self._clients[cid] for cid in self._rooms.get(room, ())
+            if cid in self._clients
+        ]
+
+    async def broadcast_to_room(self, room: str, message: Any, exclude: Optional[str] = None) -> None:
+        """Send a message to every client in a room."""
+        for client in self.room_clients(room):
+            if exclude and client.id == exclude:
+                continue
+            try:
+                await client.send(message)
+            except Exception:
+                pass
+
 
 # ── Decorators ──────────────────────────────────────────────────────────────
 
@@ -113,9 +161,24 @@ def WebSocketGateway(path: str = "/ws", *, namespace: str = ""):
     def decorator(cls):
         set_meta(cls, "is_ws_gateway", True)
         set_meta(cls, "ws_path",       path.rstrip("/") or "/ws")
-        set_meta(cls, "ws_namespace",  namespace)
+        set_meta(cls, "ws_namespace",  namespace.strip("/"))
         return cls
     return decorator
+
+
+def get_gateway_route(gateway_cls) -> tuple[str, str, str]:
+    """
+    Resolves a gateway class's routing info.
+
+    Returns (path, namespace, mount_path). `(path, namespace)` is the identity
+    used to detect route collisions between gateways; `mount_path` is the
+    actual ASGI websocket route — namespaced gateways get isolated from
+    unnamespaced (or differently-namespaced) ones sharing the same `path`.
+    """
+    path      = get_meta(gateway_cls, "ws_path", "/ws")
+    namespace = get_meta(gateway_cls, "ws_namespace", "")
+    mount_path = f"{path}/{namespace}" if namespace else path
+    return path, namespace, mount_path
 
 
 def SubscribeMessage(event: str):
@@ -175,7 +238,7 @@ def register_gateway(gateway_instance, gateway_cls, app, logger=None):
     Registers a WebSocket gateway on the FastAPI app.
     Called from factory._register_module().
     """
-    path      = get_meta(gateway_cls, "ws_path", "/ws")
+    path, namespace, mount_path = get_gateway_route(gateway_cls)
     manager   = ConnectionManager()
 
     # Collect handlers
@@ -197,16 +260,17 @@ def register_gateway(gateway_instance, gateway_cls, app, logger=None):
             handlers[event] = method
 
     if logger:
-        logger.debug(f"[FastNest] Gateway  WS  {path}  "
+        ns_suffix = f" (namespace={namespace!r})" if namespace else ""
+        logger.debug(f"[FastNest] Gateway  WS  {mount_path}{ns_suffix}  "
                      f"({len(handlers)} event(s))")
 
     # Attach manager to gateway instance so handlers can use it
     gateway_instance.manager = manager
 
-    @app.websocket(path)
+    @app.websocket(mount_path)
     async def websocket_endpoint(ws: WebSocket):
         await ws.accept()
-        client = WebSocketClient(ws)
+        client = WebSocketClient(ws, manager=manager)
         manager.add(client)
 
         # on_connect
