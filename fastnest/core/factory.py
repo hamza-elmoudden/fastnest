@@ -1,5 +1,6 @@
 # fastnest/core/factory.py
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -17,17 +18,42 @@ from fastnest.core.middleware import MiddlewareConfig
 from fastnest.core.dynamic_module import DynamicModule
 from fastnest.common.base import SchemaAwarePipe
 from fastnest.common.logger import Logger
-from fastnest.core.websocket import register_gateway
+from fastnest.core.websocket import register_gateway, get_gateway_route
 
 
-_GLOBAL_GUARDS: list = []
-_GLOBAL_INTERCEPTORS: list = []
-_GLOBAL_PIPES: list = []
+# ══════════════════════════════════════════════════════
+#  Global Guard/Pipe/Interceptor registry — scoped per app
+# ══════════════════════════════════════════════════════
+class GlobalRegistry:
+    """Holds the global guards/interceptors/pipes/filters for a single create_app() build."""
+
+    def __init__(self):
+        self.guards: list = []
+        self.interceptors: list = []
+        self.pipes: list = []
+        self.filters: list = []
 
 
-def add_global_guard(*g):       _GLOBAL_GUARDS.extend(g)
-def add_global_interceptor(*i): _GLOBAL_INTERCEPTORS.extend(i)
-def add_global_pipe(*p):        _GLOBAL_PIPES.extend(p)
+# Staging area for add_global_guard()/add_global_interceptor()/add_global_pipe()
+# calls made *before* create_app() runs (the documented usage pattern). Each
+# create_app() call consumes whatever is staged here and then clears it, so
+# registrations never leak forward into an unrelated, later create_app() call.
+_pending_registry = GlobalRegistry()
+
+# Set to the registry of the app currently being built by create_app(), so that
+# add_global_*() calls made from within a module's configure() hook (or anywhere
+# else during the build) land on that app's registry instead of the pending one.
+_active_registry: ContextVar = ContextVar("_active_registry", default=None)
+
+
+def _current_registry() -> GlobalRegistry:
+    return _active_registry.get() or _pending_registry
+
+
+def add_global_guard(*g):       _current_registry().guards.extend(g)
+def add_global_interceptor(*i): _current_registry().interceptors.extend(i)
+def add_global_pipe(*p):        _current_registry().pipes.extend(p)
+def add_global_filter(*f):      _current_registry().filters.extend(f)
 
 
 def _instantiate(x):
@@ -125,7 +151,8 @@ def _unwrap_module(module):
 
 
 def _register_module(module_ref, app, root_container, lifecycle,
-                     middleware_config, module_cache, logger):
+                     middleware_config, module_cache, logger, registry,
+                     gateway_registry):
 
     module_cls, dynamic = _unwrap_module(module_ref)
 
@@ -158,20 +185,26 @@ def _register_module(module_ref, app, root_container, lifecycle,
     for imp in imports:
         imported_c = _register_module(
             imp, app, root_container, lifecycle,
-            middleware_config, module_cache, logger,
+            middleware_config, module_cache, logger, registry,
+            gateway_registry,
         )
         module_container.import_from(imported_c)
 
     # ─── providers ───
     exports_set = set(exports)
     for prov in providers:
-        # Support custom providers {"provide": Token, "useValue": val} (future)
-        instance = module_container.get(prov)
+        if isinstance(prov, dict):
+            # Custom provider: {"provide": Token, "useValue"/"useClass"/"useFactory": ...}
+            token = prov["provide"]
+            instance = module_container.register_provider(prov)
+        else:
+            token = prov
+            instance = module_container.get(prov)
         lifecycle.register(instance)
-        if prov in exports_set:
-            module_container.register_exported(prov)
+        if token in exports_set:
+            module_container.register_exported(token)
         if is_global:
-            root_container.register_global(prov, instance)
+            root_container.register_global(token, instance)
 
     # ─── configure middleware ───
     if hasattr(module_cls, "configure"):
@@ -186,6 +219,18 @@ def _register_module(module_ref, app, root_container, lifecycle,
     if hasattr(dynamic, "gateways") and dynamic:
         gateways += getattr(dynamic, "gateways", [])
     for gw_cls in gateways:
+        path, namespace, mount_path = get_gateway_route(gw_cls)
+        route_key = (path, namespace)
+        existing = gateway_registry.get(route_key)
+        if existing is not None and existing is not gw_cls:
+            raise ValueError(
+                f"WebSocket gateway route collision: {existing.__name__!r} and "
+                f"{gw_cls.__name__!r} both resolve to path={path!r} "
+                f"namespace={namespace!r} (mount_path={mount_path!r}). "
+                f"Give one of them a distinct path or namespace."
+            )
+        gateway_registry[route_key] = gw_cls
+
         gw = module_container._create_instance(gw_cls)
         lifecycle.register(gw)
         register_gateway(gw, gw_cls, app, logger)
@@ -194,7 +239,7 @@ def _register_module(module_ref, app, root_container, lifecycle,
     for ctrl_cls in controllers:
         ctrl = module_container._create_instance(ctrl_cls)
         lifecycle.register(ctrl)
-        _register_controller_routes(ctrl, ctrl_cls, app, logger)
+        _register_controller_routes(ctrl, ctrl_cls, app, logger, registry)
 
     return module_container
 
@@ -217,7 +262,7 @@ def _build_param_type_map(handler):
     }
 
 
-def _register_controller_routes(controller, ctrl_cls, app: FastAPI, logger):
+def _register_controller_routes(controller, ctrl_cls, app: FastAPI, logger, registry):
     prefix = get_meta(ctrl_cls, "prefix", "")
 
     for name, bound, func in _iter_route_handlers(controller):
@@ -230,17 +275,19 @@ def _register_controller_routes(controller, ctrl_cls, app: FastAPI, logger):
         # Merge feature decorators (supports inheritance via get_meta)
         method_pipes = getattr(func, "_pipes", [])
         ctrl_pipes   = get_meta(ctrl_cls, "pipes", [])
-        pipes        = _GLOBAL_PIPES + ctrl_pipes + method_pipes
+        pipes        = registry.pipes + ctrl_pipes + method_pipes
 
         method_guards = getattr(func, "_guards", [])
         ctrl_guards   = get_meta(ctrl_cls, "guards", [])
-        guards        = _GLOBAL_GUARDS + ctrl_guards + method_guards
+        guards        = registry.guards + ctrl_guards + method_guards
 
         method_ics = getattr(func, "_interceptors", [])
         ctrl_ics   = get_meta(ctrl_cls, "interceptors", [])
-        interceptors = _GLOBAL_INTERCEPTORS + ctrl_ics + method_ics
+        interceptors = registry.interceptors + ctrl_ics + method_ics
 
-        filters = getattr(func, "_exception_filters", [])
+        method_filters = getattr(func, "_exception_filters", [])
+        ctrl_filters   = get_meta(ctrl_cls, "exception_filters", [])
+        filters        = registry.filters + ctrl_filters + method_filters
 
         endpoint = _build_endpoint(
             handler=bound, signature=new_sig,
@@ -323,7 +370,12 @@ def _build_endpoint(handler, signature, handler_params, request_alias,
         except HTTPException:
             raise
         except Exception as exc:
-            for fcls in filters:
+            # `filters` is assembled broad-to-narrow (global, controller, method) so it
+            # reads naturally alongside guards/pipes/interceptors, but for *catching* we
+            # want the opposite: a filter registered closer to the handler should be able
+            # to override a broader one. So we walk it narrow-to-broad (method → controller
+            # → global) and take the first filter that returns a non-None result.
+            for fcls in reversed(filters):
                 result = await call_sync_or_async(_instantiate(fcls).catch, exc, request)
                 if result:
                     return JSONResponse(
@@ -366,7 +418,9 @@ class _MiddlewareBridge(BaseHTTPMiddleware):
 # ══════════════════════════════════════════════════════
 #  create_app  (✅ حل أ: lifespan بدلاً من on_event)
 # ══════════════════════════════════════════════════════
-def create_app(module, *, debug: bool = False, title: str = "FastNest") -> FastAPI:
+def create_app(module, *, debug: bool = False, title: str = "FastNest",
+               guards: list = None, interceptors: list = None, pipes: list = None,
+               filters: list = None) -> FastAPI:
     logger = Logger("FastNest")
     if debug:
         logger.set_level("DEBUG")
@@ -375,6 +429,26 @@ def create_app(module, *, debug: bool = False, title: str = "FastNest") -> FastA
     lifecycle = _LifecycleRegistry()
     middleware_config = MiddlewareConfig()
     module_cache: dict = {}
+    gateway_registry: dict = {}
+
+    # Build this app's own global registry: start from whatever was staged via
+    # add_global_guard()/add_global_interceptor()/add_global_pipe() before this
+    # call, plus anything passed explicitly, then clear the staging area so it
+    # doesn't leak into the *next* create_app() call.
+    registry = GlobalRegistry()
+    registry.guards.extend(_pending_registry.guards)
+    registry.interceptors.extend(_pending_registry.interceptors)
+    registry.pipes.extend(_pending_registry.pipes)
+    registry.filters.extend(_pending_registry.filters)
+    registry.guards.extend(guards or [])
+    registry.interceptors.extend(interceptors or [])
+    registry.pipes.extend(pipes or [])
+    registry.filters.extend(filters or [])
+
+    _pending_registry.guards.clear()
+    _pending_registry.interceptors.clear()
+    _pending_registry.pipes.clear()
+    _pending_registry.filters.clear()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -389,8 +463,15 @@ def create_app(module, *, debug: bool = False, title: str = "FastNest") -> FastA
 
     app = FastAPI(title=title, lifespan=lifespan, debug=debug)
 
-    _register_module(module, app, root_container, lifecycle,
-                     middleware_config, module_cache, logger)
+    # While the module tree is being built, add_global_*() calls (e.g. from a
+    # module's configure() hook) should land on THIS app's registry.
+    token = _active_registry.set(registry)
+    try:
+        _register_module(module, app, root_container, lifecycle,
+                         middleware_config, module_cache, logger, registry,
+                         gateway_registry)
+    finally:
+        _active_registry.reset(token)
 
     if middleware_config._entries:
         app.add_middleware(_MiddlewareBridge, config=middleware_config)
