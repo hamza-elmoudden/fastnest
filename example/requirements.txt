@@ -10,6 +10,8 @@ h11==0.16.0
 idna==3.13
 pydantic==2.13.3
 pydantic_core==2.46.3
+pydantic-settings==2.14.2
+python-dotenv==1.2.2
 starlette==1.0.0
 typing-inspection==0.4.2
 typing_extensions==4.15.0
